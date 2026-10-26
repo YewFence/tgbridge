@@ -72,7 +72,3 @@ else
   git cliff --unreleased --tag "${tag}" --output CHANGELOG.md
 fi
 """
-
-[tasks.'release:package']
-description = "[PLACEHOLDER] Package project release artifacts"
-run = 'echo "[PLACEHOLDER] Replace release:package with project-specific packaging, or remove it when releases have no assets"'

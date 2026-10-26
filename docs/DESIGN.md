@@ -22,15 +22,15 @@
 
 ## 核心场景
 
-1. **镜像**：在 TG app 里看到文件 → 转发给 bot（或直接发送）→（带 `/mirror` 命令或开启 AUTO_MIRROR 后无需命令）→ bot 回一条确认消息 → 下载 → 上传 GD → 编辑消息为完成（附 rclone 目标路径）
-2. **回发**：转发/发送消息 + `/back` → 打包（多文件 zip、单文件原样 document）→ 大小检查（> 2,097,152,000 字节拒绝）→ bot 上传发回当前聊天
+1. **镜像**：在 TG app 里看到文件 → 转发给 bot（或直接发送，命令附着方式见下）→ bot 回一条进度消息 → 下载 → 上传 GD → 编辑消息为完成（附 rclone 目标路径）；AUTO_MIRROR 开启时无需命令
+2. **回发**：对转发/发送的消息下 `/back` 命令 → 打包（多文件 zip、单文件原样 document）→ 大小检查（> 2,097,152,000 字节拒绝）→ bot 上传发回当前聊天
 3. **相册**：转发的 media group 聚合为单个任务，逐个文件处理
 4. **表情包**：贴纸是第三种内容类型——命令不感知它，路由层识别出贴纸后自动展开为整套贴纸集作为文件列表：`/back`（或转发 + `/back`）整套打包 zip 回发；`/mirror`（或 AUTO_MIRROR 下直接转发）整套镜像到 GD。集成自旧项目 tg_sticker_bot 的概念，复用现有任务链路
 
 ### 命令与入口路由
 
 - 命令集：`/mirror`（别名 `/m`）、`/back`（别名 `/b`）、`/retry`、`/auto`、`/status`（别名 `/st`）、`/start` / `/help`
-- **命令附着**：转发时 caption 以命令开头，或对已收到的消息 reply 命令，两种皆生效；相册 caption 路径取组内首个出现的命令
+- **命令附着**（三种等价）：转发时 caption 以命令开头；对已收到的消息 reply 命令；裸发命令后 60 秒内同一发送者的下一条媒体消息配对（先回一条「⌛ 等待文件…」占位消息，带取消按钮；下一条非媒体消息使等待作废并删除占位，新的裸任务命令原地替换等待）。相册 caption 路径取组内首个出现的命令；配对优先级：裸命令等待 > 相册 caption > AUTO_MIRROR
 - **reply 到相册**：内存索引（message_id → media_group_id，TTL 约 10 分钟）使 reply 组内任一条 = 整组任务；索引查不到（重启后/过期）降级为单文件任务并附提示
 - **内容路由不看 forward 标志**：直接发送（非转发）的文件/相册/贴纸与转发的同等处理
 - **多选转发**：同一批多条独立消息各自独立成任务（每个 media group 也算一个），各一条进度消息，超并发自动排队
@@ -64,6 +64,7 @@ flowchart LR
 - `downloader.py` — TG 下载：包 kurigram `message.download()`，进度回调、取消（`stop_transmission`）、FloodWait 重试
 - `uploader.py` — rclone 上传（subprocess `rclone copy/move` + `--use-mmap` + `--stats 5s --stats-one-line` 解析进度）、回发上传（统一 `send_document` + FloodWait 重试 + 2 GiB 预检）
 - `config.py` — 环境变量优先、可选 TOML 兜底，启动时读入 frozen dataclass，无热更新
+- `log.py` — 日志双 sink：stdout 人类可读文本，可选 `LOG_FILE` 写 JSON Lines（`extra` 字段展开为顶层 key，异常附 `exception`），两者同用 `LOG_LEVEL`
 - `progress.py` — 单条消息复用为进度 UI：`edit_message_text` 节流（最短间隔 5s + FloodWait 退避）
 
 依赖：`kurigram`（MTProto client，导入名为 `pyrogram`；选型依据：Telethon 与 Pyrofork 均已归档停更，kurigram 是当前唯一活跃维护的 Python MTProto 库）、`tgcrypto`（MTProto 加速，有 wheel 无需编译）、`rclone`（外部二进制，subprocess 调用）。无数据库、无 Web UI、无 fastapi。kurigram 会话文件用 `:memory:`（bot token 认证，无需持久化会话）。
@@ -144,7 +145,8 @@ error 状态文案附异常摘要（如 `rclone exit 3: directory not found`）�
 | `AUTO_MIRROR` | 否 | `false` | 自动镜像初始值；运行时可用 `/auto` 命令切换，当前状态存内存（重启回到此配置值） |
 | `MAX_CONCURRENT` | 否 | `2` | 同时运行任务数（信号量覆盖下载+上传全生命周期） |
 | `TMP_DIR` | 否 | `/tmp/tgbridge` | 下载暂存目录，bot 独占，启动时清空其下任务子目录 |
-| `LOG_LEVEL` | 否 | `INFO` | 日志级别，日志走 stdout（容器友好） |
+| `LOG_LEVEL` | 否 | `INFO` | 日志级别，stdout 与文件两个输出同用此级别 |
+| `LOG_FILE` | 否 | 空 | 额外写一份 JSON Lines 日志到此路径；stdout 仍为人类可读格式 |
 | `GD_DIR_TEMPLATE` | 否 | `%Y-%m-%d` | 上传到远端的日期文件夹 strftime 模板，空则平铺 |
 
 ## 文件与目录
@@ -172,7 +174,7 @@ error 状态文案附异常摘要（如 `rclone exit 3: directory not found`）�
 
 - 相册聚合窗口逻辑（时间窗、去重、多组并发）与相册 reply 索引（命中/过期降级）
 - 配置解析（env 优先级、TOML 兜底、`TG_BRIDGE_CONFIG` 路径覆盖）
-- 命令路由（全名与别名 `/m` `/b` `/st`、caption/reply 两种附着、reply 相册整组）与内容识别分支（文件/相册/贴纸集、直接发送 vs 转发不区分）、inline 取消按钮 callback 路由
+- 命令路由（全名与别名 `/m` `/b` `/st`、caption/reply/裸命令等待三种附着、reply 相册整组）与内容识别分支（文件/相册/贴纸集、直接发送 vs 转发不区分）、inline 取消按钮 callback 路由
 - 2 GiB 预检与二次校验边界值、磁盘预检
 - zip 命名与内部结构（`{set_name}.zip` 带内层目录、`album_YYYYMMDD_HHMMSS.zip` 平铺）
 - strftime 日期模板渲染
@@ -182,6 +184,7 @@ TG 交互与 rclone 调用不做单元测试，靠真实环境验证（个人项
 
 ## 验收清单
 
+- [ ] 裸发 `/m` → 出现「等待文件」占位 → 转发文件 → 同一条占位变进度并完成任务；60 秒不发则占位提示失效
 - [ ] 转发单文件 + `/mirror` → GD 出现文件，进度消息走完全部状态
 - [ ] 直接发送（非转发）单文件 + `/m` → 与转发同等处理
 - [ ] 转发相册（3 张图）+ `/mirror` → 占位「聚合中」消息先出，窗口关闭转进度，一个任务、GD 每日文件夹 3 文件

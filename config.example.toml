@@ -1,0 +1,34 @@
+# TgBridge configuration example.
+#
+# Copy to config.toml for local development. Environment variables take precedence
+# over every key here, so a container deployment can ignore this file entirely.
+# Point the bot at a different file with TG_BRIDGE_CONFIG=/path/to/config.toml.
+
+bot_token = "123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11"
+api_id = 123456
+api_hash = "0123456789abcdef0123456789abcdef"
+
+# Comma-separated chat IDs (private chats are user IDs, groups/channels are chat IDs).
+allowed_chats = "123456789,-1001234567890"
+
+# An rclone remote name, as listed by `rclone listremotes`. Any remote works.
+# TgBridge inherits rclone's environment, so RCLONE_CONFIG selects which rclone.conf
+# is read; nothing else about rclone needs configuring here.
+rclone_remote = "gdrive:media"
+
+# Mirror plain forwards without an explicit command.
+auto_mirror = false
+
+# Tasks running at once (the semaphore covers download and upload).
+max_concurrent = 2
+
+# Scratch space, wiped on startup. Give it room for the largest file you mirror.
+tmp_dir = "/tmp/tgbridge"
+
+log_level = "INFO"
+
+# Also write JSON Lines to this path (stdout stays human-readable). Empty disables it.
+log_file = ""
+
+# strftime template for the per-run folder under the remote; "" flattens the layout.
+gd_dir_template = "%Y-%m-%d"
