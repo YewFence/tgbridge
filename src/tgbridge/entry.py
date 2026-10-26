@@ -12,8 +12,8 @@ from pyrogram import Client, errors
 from pyrogram.handlers import CallbackQueryHandler, MessageHandler
 from pyrogram.types import BotCommand
 
-from tgbridge import progress
 from tgbridge import log as tgbridge_log
+from tgbridge import progress
 from tgbridge.config import Config, ConfigError, load_config
 from tgbridge.downloader import Downloader
 from tgbridge.handlers import AllowedChats, BotHandlers, album_loop
@@ -28,6 +28,11 @@ from tgbridge.uploader import (
 )
 
 LOGGER = logging.getLogger("tgbridge")
+
+
+class StartupError(Exception):
+    """The process cannot start, with a message meant for the operator."""
+
 
 BOT_COMMANDS = [
     BotCommand("mirror", "镜像当前、回复的或紧接着发送的媒体"),
@@ -80,7 +85,15 @@ async def serve(config: Config) -> None:
     reset_tmp_dir(config.tmp_dir)
 
     client = build_client(config)
-    await client.start()
+    try:
+        await client.start()
+    except (OSError, ConnectionError, errors.RPCError) as error:
+        # A container that cannot reach Telegram should say so, not dump a traceback.
+        message = (
+            "cannot connect to Telegram: "
+            f"{progress.summarize(str(error) or type(error).__name__)}"
+        )
+        raise StartupError(message) from error
     LOGGER.info("connected as @%s", getattr(client.me, "username", "unknown"))
     await _register_commands(client)
 
@@ -135,6 +148,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 2
     try:
         asyncio.run(serve(config))
+    except StartupError as error:
+        LOGGER.error("startup failed: %s", error)
+        return 1
     except KeyboardInterrupt:
         return 130
     return 0

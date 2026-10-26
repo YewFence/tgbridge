@@ -135,6 +135,19 @@ run = "ruff check --fix ."
 description = "Install Git hooks managed by hk"
 run = "hk install"
 
+[tasks.'container:build']
+description = "Build the container image locally"
+run = "docker build -t tgbridge:dev ."
+
+[tasks.'container:up']
+description = "Start the bot with docker compose"
+depends = ["container:build"]
+run = "docker compose up -d"
+
+[tasks.'container:down']
+description = "Stop the bot and drop its volume"
+run = "docker compose down -v"
+
 [tasks.'docs:install']
 description = "Install documentation site dependencies"
 dir = "docs"

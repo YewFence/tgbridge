@@ -40,30 +40,37 @@ uv run python -m tgbridge.entry
 
 ### As a container
 
-The image runs `python -m tgbridge.entry` and expects configuration through
-environment variables. Keep the scratch directory on fast local storage and point
-`RCLONE_CONFIG` at a mounted `rclone.conf`:
+Build locally and start with compose — that is the whole flow:
 
-```yaml
-services:
-  tgbridge:
-    image: ghcr.io/yewfence/tgbridge:latest
-    restart: unless-stopped
-    environment:
-      BOT_TOKEN: ${BOT_TOKEN}
-      API_ID: ${API_ID}
-      API_HASH: ${API_HASH}
-      ALLOWED_CHATS: ${ALLOWED_CHATS}
-      RCLONE_REMOTE: gdrive:media
-      RCLONE_CONFIG: /config/rclone/rclone.conf
-    volumes:
-      - ./rclone:/config/rclone:ro
-    tmpfs:
-      - /tmp/tgbridge
+```bash
+cp .env.example .env          # fill in the credentials and RCLONE_REMOTE
+docker build -t tgbridge:dev .
+docker compose up -d
+docker compose logs -f tgbridge
 ```
 
+The repository's `compose.yaml` runs two containers. A one-shot init container copies
+your `rclone.conf` into a named volume, and the bot mounts that volume. This is not
+ceremony: rclone rewrites `rclone.conf` whenever it refreshes an OAuth token, so binding
+the host file directly would let those writes land in your host directory and leave the
+file root-owned. The init container copies with `install -o 65534 -g 65534 -m 600`, so
+the host file stays a read-only input and the bot (running as `nobody`) can still rewrite
+its own copy.
+
+Point `RCLONE_CONFIG_FILE` in `.env` at your plaintext `rclone.conf`; it is mounted
+read-only into the init container. The download scratch directory is a named volume, so
+downloads use disk rather than RAM; the bot wipes it on startup anyway, so it never needs
+to persist.
+
 `docker stop` sends `SIGTERM`, which cancels active tasks (stopping downloads, killing
-rclone, clearing scratch files) before the process exits.
+rclone, clearing scratch files) before the process exits, within
+`stop_grace_period: 30s`. The bot also refuses to start with an unusable rclone remote
+(exit 2) and logs a single `startup failed: cannot connect to Telegram` line (exit 1)
+when Telegram is unreachable, leaving restarts to the compose `restart` policy.
+
+See the [container notes](https://github.com/YewFence/tgbridge/blob/main/docs/CONTAINER.md)
+for the multi-stage build layout, the tooling/version pinning, and how to build behind a
+proxy.
 
 ## Usage
 

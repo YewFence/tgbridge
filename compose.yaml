@@ -1,0 +1,56 @@
+# Local and VPS deployment.  `docker compose up -d` is enough to start:
+# the init container copies the rclone config into a named volume first, then the bot
+# runs against it.
+#
+# Configuration comes from .env next to this file (see .env.example).
+
+services:
+  # rclone rewrites rclone.conf whenever it refreshes an OAuth token.  Bind-mounting the
+  # host file would let those writes land in the host directory and turn the file
+  # root-owned, so the config is copied into a named volume once per start instead.
+  rclone-config:
+    image: debian:13-slim
+    restart: "no"
+    volumes:
+      # Plaintext rclone.conf prepared on the host; read-only input, never written back.
+      - ${RCLONE_CONFIG_FILE:-./rclone.conf}:/input/rclone.conf:ro
+      - rclone-config:/out
+    entrypoint:
+      - /bin/sh
+      - -c
+    # The runtime image runs as nobody (65534); match that here so the bot can rewrite
+    # the token in place.
+    command:
+      - install -o 65534 -g 65534 -m 600 /input/rclone.conf /out/rclone.conf
+
+  tgbridge:
+    image: ${TGBRIDGE_IMAGE:-tgbridge:dev}
+    build:
+      context: .
+    restart: unless-stopped
+    depends_on:
+      rclone-config:
+        condition: service_completed_successfully
+    environment:
+      BOT_TOKEN: ${BOT_TOKEN:?set BOT_TOKEN in .env}
+      API_ID: ${API_ID:?set API_ID in .env}
+      API_HASH: ${API_HASH:?set API_HASH in .env}
+      ALLOWED_CHATS: ${ALLOWED_CHATS:?set ALLOWED_CHATS in .env}
+      RCLONE_REMOTE: ${RCLONE_REMOTE:?set RCLONE_REMOTE in .env}
+      AUTO_MIRROR: ${AUTO_MIRROR:-false}
+      MAX_CONCURRENT: ${MAX_CONCURRENT:-2}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      LOG_FILE: /var/log/tgbridge/tgbridge.jsonl
+      GD_DIR_TEMPLATE: ${GD_DIR_TEMPLATE:-%Y-%m-%d}
+    volumes:
+      - rclone-config:/config/rclone
+      - tgbridge-tmp:/tmp/tgbridge
+      # JSONL logs outlive the container, so a crash can be read back afterwards.
+      - tgbridge-logs:/var/log/tgbridge
+    # `docker stop` sends SIGTERM, which cancels active tasks before exiting.
+    stop_grace_period: 30s
+
+volumes:
+  rclone-config:
+  tgbridge-tmp:
+  tgbridge-logs:

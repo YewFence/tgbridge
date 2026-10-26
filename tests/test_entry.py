@@ -194,3 +194,33 @@ def test_main_aborts_when_the_remote_is_missing(
     monkeypatch.setattr(entry, "verify_remote", fail)
 
     assert entry.main([]) == 2
+
+
+async def test_serve_reports_an_unreachable_telegram(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    class UnreachableClient:
+        me = None
+
+        async def start(self) -> None:
+            raise ConnectionError
+
+    monkeypatch.setattr(entry, "build_client", lambda _config: UnreachableClient())
+
+    with pytest.raises(entry.StartupError, match="cannot connect to Telegram"):
+        await entry.serve(make_config(tmp_path))
+
+
+def test_main_exits_non_zero_on_startup_failure(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(entry, "load_config", lambda: make_config(tmp_path))
+    monkeypatch.setattr(entry, "verify_remote", lambda _remote: None)
+
+    async def fail(_config: Config) -> None:
+        raise entry.StartupError("cannot connect to Telegram: ConnectionError")
+
+    monkeypatch.setattr(entry, "serve", fail)
+
+    assert entry.main([]) == 1

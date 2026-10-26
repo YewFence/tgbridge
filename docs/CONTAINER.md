@@ -1,109 +1,108 @@
-# 容器发布设计（设想稿）
+# 容器部署
 
-发布 `ghcr.io/yewfence/tgbridge` 镜像。当前为设计文档，代码落地后按此实施；`mise.toml` 中的 rclone 工具项已先行合入（PoC 与镜像构建共用）。
+发布 `ghcr.io/yewfence/tgbridge` 镜像。当前落地的是**本地构建 + compose 启动**这条链路；
+GitHub Actions 的镜像发布流水线留待后续接入（见文末「待接入」）。
 
 ## 目标与约束
 
-- 镜像发布到 ghcr.io，随 release tag 触发，稳定版同时更新 `latest`
-- 版本链路复用仓库现有的两把锁：python / rclone 版本由 `mise.lock` 锁定，Python 依赖由 `uv.lock` 锁定，不为镜像新增任何版本来源
-- **mise 与 uv 只存在于构建阶段，不进入最终镜像**（mise 全家桶很大，bot 运行时不需要）
+- 版本链路复用仓库现有的两把锁：python / rclone / uv 由 `mise.lock` 锁定，Python 依赖由
+  `uv.lock` 锁定，不为镜像新增任何版本来源
+- **mise 与 uv 只存在于构建阶段，不进入最终镜像**
+- 镜像内装的是项目 wheel（与将来发 PyPI 的产物同形），不是源码目录
 - 多架构 `linux/amd64` + `linux/arm64`（`mise.lock` 已锁全部 4 个 linux 平台条目）
-
-## 依据（已验证的前提）
-
-- mise 安装的 python 是 [python-build-standalone](https://github.com/astral-sh/python-build-standalone) 发行版，安装目录整体拷贝到其他路径后 `bin/python3` 可直接运行（ssl/sqlite3/zlib 扩展均正常）
-- rclone 经 `aqua:rclone/rclone` 后端安装，单静态二进制，直接 `COPY` 到 `/usr/local/bin`
-- `mise install --locked` 按 `mise.lock` 安装，不查询版本列表（见 mise 文档 [Docker cookbook](https://mise.jdx.dev/mise-cookbook/docker.html)）
 
 ## Dockerfile（多阶段）
 
-```dockerfile
-# syntax=docker/dockerfile:1
+`Dockerfile` 三段：
 
-# ---- tools: 官方 mise 镜像里按锁安装 python/uv/rclone ----
-FROM ghcr.io/jdx/mise:2026.10.4-debian AS tools
-# mise 镜像默认 MISE_DATA_DIR=/mise；改为显式固定，避免依赖镜像内部约定
-ENV MISE_DATA_DIR=/mise-data
-COPY mise.toml mise.lock ./
-# 只装镜像需要的工具；ruff/node/hk 等开发工具不进
-RUN mise trust && mise install --locked python uv rclone
+| 阶段 | 内容 |
+|---|---|
+| `tools` | 官方 mise 镜像里 `mise install --locked python uv rclone`，然后用 `mise which` / `mise where` 把三者摊平到固定路径（`/opt/python`、`/usr/local/bin/{uv,rclone}`），后续阶段不依赖 mise 的版本化目录布局 |
+| `deps` | 装 `build-essential`（`tgcrypto` 对当前解释器无 wheel，需从 sdist 编译），在最终路径 `/opt/venv` 建 venv，`uv build` 出 wheel，再用 `uv export --locked` + `--require-hashes` 装依赖，最后 `--no-deps` 装上 wheel |
+| runtime | `debian:13-slim` + `ca-certificates`，只拷 `/opt/python`、`/opt/venv`、`rclone` 三样；无 mise、无 uv、无编译器 |
 
-# ---- deps: 把 python 拷到最终路径，构建 wheel 并装入 venv ----
-FROM tools AS deps
-# 通配符吸收版本号，升级 python 无需改 Dockerfile
-COPY --from=tools /mise-data/installs/python/3*/ /opt/python/
-# venv 在最终路径上新建，无预建 venv 的路径锚定问题
-RUN /opt/python/bin/python3 -m venv /opt/venv
-COPY pyproject.toml uv.lock ./
-RUN uv build --locked --out-dir /dist
-COPY src/ src/
-RUN uv build --locked --out-dir /dist
-RUN UV_PROJECT_ENVIRONMENT=/opt/venv uv pip install --python /opt/venv/bin/python /dist/*.whl
+关键点：
 
-# ---- runtime: 最终镜像不含 mise/uv ----
-FROM debian:13-slim
-RUN apt-get update \
-    && apt-get -y --no-install-recommends install ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
-COPY --from=deps /opt/python /opt/python
-COPY --from=deps /opt/venv /opt/venv
-COPY --from=tools /mise-data/installs/rclone/1*/bin/rclone /usr/local/bin/rclone
-USER nobody
-ENTRYPOINT ["/opt/venv/bin/python", "-m", "tgbridge.entry"]
-```
-
-说明：
-
-- **复用 `uv build`**：镜像内安装的是项目 wheel 而非源码目录，wheel 同时是未来发 PyPI 的产物形态；两次 `uv build` 中第一次利用 Docker 层缓存锁依赖元数据，源码变更时不重跑依赖解析
-- mise 镜像 tag（`2026.10.4`）随 `actions:update` / renovate 更新，必要时可升级为 digest 固定（`ghcr.io/jdx/mise@sha256:<digest>`）
-- `ENTRYPOINT` 指向 `tgbridge.entry`，与 DESIGN.md 的入口模块对齐，代码落地时校正
-
-## 发布流水线
-
-沿用仓库模板（thin workflow）的结构：workflow 只做编排，实际命令在 mise task。
-
-**`.github/workflows/release.yml` 新增 job**（形状参考模板 go-cli 的 container-image capability）：
-
-- `publish-container`：`needs: [version, release]`，`if: should_release == 'true'`
-- permissions: `contents: read, packages: write`
-- 步骤：checkout（`checkout_ref`）→ mise-action（`install_args: docker` 或 docker buildx 由 runner 自带）→ `GITHUB_TOKEN` 登录 ghcr → `mise run container:publish`
-
-**`mise.ci.toml` 新增 task**：
-
-- `container:publish`：`docker buildx build --platform linux/amd64,linux/arm64 --push`，tag 取 `RELEASE_TAG`；非 prerelease 追加 `latest`
-- `container:build`：本地单架构构建（`ko.local` 等价的 `container:publish --dry-run` 形态，供本地 smoke）
-
-**新增 Action**（`docker/build-push-action`、`docker/login-action`、`docker/setup-buildx-action` 等）一律 pinact 固定。
+- **`mise which` 而不是硬编码路径**：rclone 经 aqua 后端安装，二进制在解包后的
+  `rclone-v*-linux-*/` 目录里；uv 在 `.mise-bins/` 下。写死路径会在工具升级时静默失效。
+- **依赖安装带哈希**：`uv export --locked --no-dev --no-emit-project --format requirements.txt`
+  导出锁文件（含 `--hash`），`uv pip install --require-hashes` 校验，锁文件即唯一事实来源。
+- **`uv build` 显式产出 wheel**：镜像里装的就是 wheel，而非 `uv sync` 的临时构建，产物形态
+  与未来发 PyPI 一致，也让「装进去的到底是什么」可验证。
+- 分层顺序保证锁文件不变时源码改动不触发依赖重解析。
 
 ## 运行时约定
 
-- 配置全走环境变量：`BOT_TOKEN` / `API_ID` / `API_HASH` / `ALLOWED_CHATS` / `RCLONE_REMOTE` 等（DESIGN.md 配置表）
-- rclone 配置经 volume 挂载：`-v ~/.config/rclone:/config/rclone`，容器内 `RCLONE_CONFIG=/config/rclone/rclone.conf`（或 `XDG_CONFIG_HOME`）
-- 下载暂存 `TMP_DIR` 默认 `/tmp/tgbridge`，如需持久卷挂载可覆盖
+- 配置全走环境变量：`BOT_TOKEN` / `API_ID` / `API_HASH` / `ALLOWED_CHATS` / `RCLONE_REMOTE` 等
+- 以 `nobody`（65534）运行；`/config/rclone` 与 `/tmp/tgbridge` 在镜像内预建为该属主，
+  因此**新建命名卷会继承该属主**，不会变成 root 属主
+- `RCLONE_CONFIG=/config/rclone/rclone.conf`，`TMP_DIR=/tmp/tgbridge`
+- 两个命名卷：`rclone-config` 存 init 容器拷入的 rclone 配置，`tgbridge-tmp` 挂到
+  `/tmp/tgbridge` 作为下载暂存。暂存卷落盘而非 tmpfs，下载量不再计入内存占用
+- `stop_grace_period: 30s`：`docker stop` 的 SIGTERM 会取消活跃任务（停下载、杀 rclone、清暂存）
+- 启动即校验 rclone remote 与 Telegram 连通性：remote 未配置直接 exit 2；连不上 Telegram
+  打一行 `startup failed: cannot connect to Telegram` 并 exit 1，交给 `restart` 策略重试
 
-## compose.yaml 示例（发布后补）
+### rclone 配置为什么要过 init 容器
+
+rclone 在刷新 OAuth token 时会**回写 `rclone.conf`**。直接 bind 挂载宿主机明文文件有两个后果：
+回写污染宿主机的解密目录，以及容器内写入把文件变成 root 属主。
+
+所以用一次性 init 容器把宿主机文件拷进命名卷，再让业务容器挂载该卷：
 
 ```yaml
 services:
-  tgbridge:
-    image: ghcr.io/yewfence/tgbridge:latest
-    restart: unless-stopped
-    environment:
-      BOT_TOKEN: ${BOT_TOKEN}
-      API_ID: ${API_ID}
-      API_HASH: ${API_HASH}
-      ALLOWED_CHATS: ${ALLOWED_CHATS}
-      RCLONE_REMOTE: gdrive:media
+  rclone-config:
+    image: debian:13-slim
+    restart: "no"
     volumes:
-      - ./rclone:/config/rclone:ro
-    tmpfs:
-      - /tmp/tgbridge
+      - ${RCLONE_CONFIG_FILE:-./rclone.conf}:/input/rclone.conf:ro
+      - rclone-config:/out
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - install -o 65534 -g 65534 -m 600 /input/rclone.conf /out/rclone.conf
 ```
 
-## 实施清单（代码落地后）
+`install` 一步同时完成拷贝与属主/权限设定，宿主机文件保持只读输入、不被回写。
 
-- [ ] `Dockerfile` + `.dockerignore`（排除 `.env*`、`**/*.local.toml`、docs、`.git` 等）
-- [ ] 本地 smoke：`mise run container:build` 后跑通「启动 → 收到转发 → GD 出现文件」最小链路
-- [ ] `mise.ci.toml` 两个 task + release.yml job + pinact 固定新 action
-- [ ] 首次发布后：ghcr 包可见性 / 仓库关联设置
-- [ ] README / docs 补「Container Image」一节（参考模板 README-section 文案）
+## 本地构建与启动
+
+```bash
+cp .env.example .env          # 填 BOT_TOKEN / API_ID / API_HASH / ALLOWED_CHATS / RCLONE_REMOTE
+# 准备好 rclone.conf（RCLONE_CONFIG_FILE 指向它），或用 .env 覆盖该路径
+mise run container:up         # = docker build -t tgbridge:dev . && docker compose up -d
+docker compose logs -f tgbridge
+mise run container:down       # 停服务并删卷
+```
+
+若构建期需要走代理（例如国内网络拉 python-build-standalone / aqua 资产）：
+
+```bash
+docker build --network=host \
+  --build-arg HTTP_PROXY=http://127.0.0.1:7897 \
+  --build-arg HTTPS_PROXY=http://127.0.0.1:7897 \
+  --build-arg NO_PROXY=localhost,127.0.0.1 \
+  -t tgbridge:dev .
+```
+
+`--network=host` 让构建容器能访问宿主机上的 `127.0.0.1` 代理；`HTTP_PROXY` / `HTTPS_PROXY`
+是 Docker 预定义的 build arg，无需在 Dockerfile 里声明。注意用不带 MITM 凭据的普通代理端口，
+否则 TLS 证书校验会失败。
+
+## 推送到 VPS 验证
+
+镜像不依赖构建机架构之外的东西，直接 save/load 或经 registry 中转即可：
+
+```bash
+docker save tgbridge:dev | gzip | ssh vps 'gunzip | docker load'
+# 或 docker tag tgbridge:dev ghcr.io/<user>/tgbridge:dev && docker push ...
+```
+
+VPS 上同样需要 `.env` 与 `rclone.conf`，`docker compose up -d` 即可。
+
+## 待接入
+
+- GitHub Actions 发布流水线：release tag 触发 `docker buildx build --platform linux/amd64,linux/arm64 --push`，
+  非 prerelease 追加 `latest`；新增 action 一律 pinact 固定
+- `mise.ci.toml` 的 `container:publish` task（多架构 push）与 `container:build:ci`（CI 单架构构建）
+- 首次发布后：ghcr 包可见性与仓库关联设置
