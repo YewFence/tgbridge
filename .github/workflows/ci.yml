@@ -1,0 +1,71 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: Checks
+    runs-on: ubuntu-latest
+    env:
+      MISE_TASK_RUN_AUTO_INSTALL: "false"
+      MISE_LOCKED: "1"
+      MISE_ENV: "ci"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: jdx/mise-action@8418fedb1110381a0d3ba51a7a415d7c1b884550 # v5.2.2
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          add_shims_to_path: true
+          cache_key: "mise-check-{{file_hash}}"
+
+      - name: Validate CI tool locks
+        run: mise install --dry-run --locked
+
+      - name: Check
+        run: mise run check
+
+  docs:
+    name: Docs
+    runs-on: ubuntu-latest
+    env:
+      MISE_TASK_RUN_AUTO_INSTALL: "false"
+      MISE_LOCKED: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: jdx/mise-action@8418fedb1110381a0d3ba51a7a415d7c1b884550 # v5.2.2
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          add_shims_to_path: true
+          cache_key: "mise-docs-{{file_hash}}"
+
+      - name: Resolve pnpm store path
+        id: pnpm-store
+        run: echo "path=$(pnpm store path --silent)" >> "${GITHUB_OUTPUT}"
+
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ steps.pnpm-store.outputs.path }}
+          key: pnpm-${{ runner.os }}-${{ hashFiles('docs/pnpm-lock.yaml') }}
+          restore-keys: |
+            pnpm-${{ runner.os }}-
+
+      - name: Build
+        run: mise run docs:build
