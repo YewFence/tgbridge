@@ -1,0 +1,12 @@
+# Local development override.  Use it with the base compose.yaml:
+#
+#   docker compose -f compose.yaml -f compose.dev.yaml up -d
+#
+# It builds the bot image from this checkout instead of pulling the published one,
+# so local source changes are picked up without publishing anything.
+
+services:
+  tgbridge:
+    image: tgbridge:dev
+    build:
+      context: .

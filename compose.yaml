@@ -1,6 +1,10 @@
-# Local and VPS deployment.  `docker compose up -d` is enough to start:
-# the init container copies the rclone config into a named volume first, then the bot
-# runs against it.
+# Deployment recipe.  `docker compose up -d` is enough to start: the init container
+# copies the rclone config into a named volume first, then the bot runs against it.
+#
+# The bot image comes from the registry.  Set TGBRIDGE_IMAGE in .env to pin a
+# version, e.g. ghcr.io/yewfence/tgbridge:0.1.0; without it the `latest` tag is
+# used.  For local development use compose.dev.yaml instead, which builds the
+# image from this checkout.
 #
 # Configuration comes from .env next to this file (see .env.example).
 
@@ -24,9 +28,7 @@ services:
       - install -o 65534 -g 65534 -m 600 /input/rclone.conf /out/rclone.conf
 
   tgbridge:
-    image: ${TGBRIDGE_IMAGE:-tgbridge:dev}
-    build:
-      context: .
+    image: ${TGBRIDGE_IMAGE:-ghcr.io/yewfence/tgbridge:latest}
     restart: unless-stopped
     depends_on:
       rclone-config:

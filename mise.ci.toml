@@ -72,3 +72,65 @@ else
   git cliff --unreleased --tag "${tag}" --output CHANGELOG.md
 fi
 """
+
+[tasks.'release:version:sync']
+description = "Set the project version in pyproject.toml to the release version"
+shell = "bash -c"
+run = """
+tag="$(mise run release:tag)"
+version="${tag#v}"
+
+if [[ "${version}" == "${tag}" ]]; then
+  echo "release tag ${tag} does not carry a version"
+  exit 1
+fi
+
+current="$(uv version --short)"
+if [[ "${current}" == "${version}" ]]; then
+  echo "pyproject.toml already declares version ${version}"
+  exit 0
+fi
+
+uv version "${version}"
+echo "Set project version ${current} -> ${version}"
+"""
+
+[tasks.'release:version:check']
+description = "Verify the project version matches the release tag"
+shell = "bash -c"
+run = """
+tag="$(mise run release:tag)"
+version="${tag#v}"
+current="$(uv version --short)"
+
+if [[ "${current}" != "${version}" ]]; then
+  echo "project version ${current} does not match release tag ${tag}"
+  echo "rerun the prepare release workflow to refresh the version"
+  exit 1
+fi
+
+echo "Project version ${current} matches release tag ${tag}"
+"""
+
+[tasks.'container:tags']
+description = "Print the container image tags for a release, one per line"
+shell = "bash -c"
+run = """
+tag="$(mise run release:tag)"
+version="${tag#v}"
+
+if [[ "${version}" == "${tag}" ]]; then
+  echo "release tag ${tag} does not carry a version"
+  exit 1
+fi
+
+printf 'type=raw,value=%s\\n' "${version}"
+
+# A prerelease must never become the "latest" image: users pulling latest expect
+# the newest stable release.
+if [[ "${version}" == *-* ]]; then
+  exit 0
+fi
+
+printf 'type=raw,value=latest\\n'
+"""

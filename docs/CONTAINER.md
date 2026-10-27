@@ -1,7 +1,7 @@
 # 容器部署
 
-发布 `ghcr.io/yewfence/tgbridge` 镜像。当前落地的是**本地构建 + compose 启动**这条链路；
-GitHub Actions 的镜像发布流水线留待后续接入（见文末「待接入」）。
+发布 `ghcr.io/yewfence/tgbridge` 镜像。release tag 触发 GitHub Actions 构建并推送多架构镜像，
+本地开发则用 compose 启动（见下）。
 
 ## 目标与约束
 
@@ -67,12 +67,22 @@ services:
 
 ## 本地构建与启动
 
+`compose.yaml` 是部署配方（拉取已发布镜像），`compose.dev.yaml` 是本地开发覆盖层
+（从当前 checkout 构建）。开发时用 mise task，它已经带上了这两个文件：
+
 ```bash
 cp .env.example .env          # 填 BOT_TOKEN / API_ID / API_HASH / ALLOWED_CHATS / RCLONE_REMOTE
 # 准备好 rclone.conf（RCLONE_CONFIG_FILE 指向它），或用 .env 覆盖该路径
-mise run container:up         # = docker build -t tgbridge:dev . && docker compose up -d
-docker compose logs -f tgbridge
+mise run container:up         # = docker build -t tgbridge:dev . && docker compose -f compose.yaml -f compose.dev.yaml up -d
+docker compose -f compose.yaml -f compose.dev.yaml logs -f tgbridge
 mise run container:down       # 停服务并删卷
+```
+
+部署到 VPS 时只用基础文件，它拉取已发布镜像而不构建：
+
+```bash
+docker compose up -d          # 拉取 ghcr.io/yewfence/tgbridge:latest
+TGBRIDGE_IMAGE=ghcr.io/yewfence/tgbridge:0.1.0 docker compose up -d   # 固定版本
 ```
 
 若构建期需要走代理（例如国内网络拉 python-build-standalone / aqua 资产）：
@@ -95,14 +105,58 @@ docker build --network=host \
 
 ```bash
 docker save tgbridge:dev | gzip | ssh vps 'gunzip | docker load'
-# 或 docker tag tgbridge:dev ghcr.io/<user>/tgbridge:dev && docker push ...
+# 或 docker tag tgbridge:dev ghcr.io/yewfence/tgbridge:dev && docker push ...
 ```
 
 VPS 上同样需要 `.env` 与 `rclone.conf`，`docker compose up -d` 即可。
 
-## 待接入
+## 发布流水线
 
-- GitHub Actions 发布流水线：release tag 触发 `docker buildx build --platform linux/amd64,linux/arm64 --push`，
-  非 prerelease 追加 `latest`；新增 action 一律 pinact 固定
-- `mise.ci.toml` 的 `container:publish` task（多架构 push）与 `container:build:ci`（CI 单架构构建）
-- 首次发布后：ghcr 包可见性与仓库关联设置
+镜像由 `.github/workflows/release.yml` 的 `container` job 发布，走 Docker 官方的 reusable
+workflow [`docker/github-builder`](https://github.com/docker/github-builder)：
+
+| 环节 | 行为 |
+|---|---|
+| 触发 | 与 GitHub Release 同一时机：push `v*` tag、release PR 合并、或手动 `workflow_dispatch` |
+| 镜像名 | `ghcr.io/yewfence/tgbridge`（ghcr 要求仓库名小写） |
+| tag | 版本号（如 `0.1.0`）；稳定版额外打 `latest`，**预发布版本不打 `latest`** |
+| 架构 | `linux/amd64` + `linux/arm64` |
+| 凭据 | `GITHUB_TOKEN` 登录 ghcr，需要 `packages: write` 权限 |
+
+### 原生多架构，无 QEMU
+
+`docker/github-builder` 按平台把构建拆成矩阵，并映射到对应的 GitHub 托管 runner：
+
+```text
+linux/amd64 -> ubuntu-26.04
+linux/arm64 -> ubuntu-26.04-arm
+```
+
+每个平台在原生 arm64/amd64 runner 上编译，不走 QEMU 模拟。构建按 digest 推送，
+再由 reusable workflow 内部的 `finalize` job 自动合并成多平台 manifest 并打 tag——
+不需要手写 digest 传递或 manifest 合并步骤。
+
+`tgcrypto` 在当前解释器上没有 wheel，arm64 上同样从 sdist 编译，所以 `deps` 阶段在两个架构上
+都要装 `build-essential`。
+
+### 版本号是单一来源
+
+`pyproject.toml` 是项目版本的唯一事实来源：
+
+- `prepare-release` workflow 用 `mise run release:version:sync` 把版本写成 release tag 的版本号
+  （`uv version` 同时更新 `pyproject.toml` 和 `uv.lock`），并把这两个文件一起提交进 release PR
+- `src/tgbridge/__init__.py` 从已安装的 dist 元数据读版本（`importlib.metadata`），
+  因此镜像里 `/status` 报的就是该 release 的版本，不会停留在旧值
+
+### 构建 commit 必须与 tag 一致
+
+镜像构建的源码来自 git context，固定在 `GITHUB_SHA` 上。手动 `workflow_dispatch` 时
+`GITHUB_SHA` 是所选分支的 HEAD，而不是 release tag 指向的 commit——那样产出的镜像会挂着
+release 的版本号却装着更新的代码。
+
+因此 `container-tags` job 会比对 `GITHUB_SHA` 与 release commit：不一致就跳过镜像发布，
+并在 job summary 里写明原因。push tag 和 release PR 合并两条路径天然一致，不受影响。
+
+### 首次发布后
+
+ghcr 包默认与仓库关联但可能不是公开的，需要在包的设置里把可见性调整为需要的状态。

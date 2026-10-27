@@ -54,6 +54,19 @@ keys are required:
 A `config.toml` copy of the same keys (lowercase) works for local development — see
 [`config.example.toml`](config.example.toml).
 
+### Run the Container Image
+
+```bash
+cp .env.example .env          # fill in the credentials and RCLONE_REMOTE
+docker compose up -d
+docker compose logs -f tgbridge
+```
+
+The image is published to `ghcr.io/yewfence/tgbridge` for `linux/amd64` and `linux/arm64`,
+carrying a version tag and `latest` for stable releases. Set `TGBRIDGE_IMAGE` in `.env` to
+pin a version. See the [container guide](https://github.com/YewFence/tgbridge/blob/main/docs/CONTAINER.md)
+for the build layout and the local development overlay.
+
 ### Build From Source
 
 ```bash

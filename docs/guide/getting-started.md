@@ -40,14 +40,30 @@ uv run python -m tgbridge.entry
 
 ### As a container
 
-Build locally and start with compose — that is the whole flow:
+Pull the published image and start it with compose:
 
 ```bash
 cp .env.example .env          # fill in the credentials and RCLONE_REMOTE
-docker build -t tgbridge:dev .
 docker compose up -d
 docker compose logs -f tgbridge
 ```
+
+The image is published to `ghcr.io/yewfence/tgbridge` for `linux/amd64` and `linux/arm64`.
+It carries a version tag (`0.1.0`) and, for stable releases, `latest`. Point compose at a
+specific version by setting `TGBRIDGE_IMAGE` in `.env`:
+
+```bash
+TGBRIDGE_IMAGE=ghcr.io/yewfence/tgbridge:0.1.0
+```
+
+`compose.yaml` is the deployment recipe and pulls that image. To run your local changes
+instead, add the `compose.dev.yaml` overlay, which builds from this checkout:
+
+```bash
+docker compose -f compose.yaml -f compose.dev.yaml up -d
+```
+
+`mise run container:up` does exactly that (build, then start with the overlay).
 
 The repository's `compose.yaml` runs two containers. A one-shot init container copies
 your `rclone.conf` into a named volume, and the bot mounts that volume. This is not

@@ -267,6 +267,105 @@ jobs:
           echo "Published GitHub Release ${release_url}"
           echo "| URL | ${release_url} |" >> "${GITHUB_STEP_SUMMARY}"
 
+  container-tags:
+    name: Resolve Image Tags
+    needs:
+      - version
+      - release
+    if: ${{ needs.version.outputs.should_release == 'true' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      skip: ${{ steps.tags.outputs.skip }}
+      tags: ${{ steps.tags.outputs.tags }}
+    env:
+      MISE_TASK_RUN_AUTO_INSTALL: "false"
+      MISE_LOCKED: "1"
+      MISE_ENV: "ci"
+      RELEASE_TAG: ${{ needs.version.outputs.tag }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.version.outputs.checkout_ref }}
+          persist-credentials: false
+
+      - name: Setup mise
+        uses: jdx/mise-action@8418fedb1110381a0d3ba51a7a415d7c1b884550 # v5.2.2
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          # git-cliff is not needed here, but uv reads the project version so the
+          # image cannot carry a version that disagrees with its tag.
+          install_args: uv
+          add_shims_to_path: true
+          cache_key: "mise-container-{{install_args_hash}}-{{file_hash}}"
+
+      - name: Resolve image tags
+        id: tags
+        env:
+          RELEASE_COMMIT: ${{ needs.version.outputs.checkout_ref }}
+        run: |
+          # The image build pulls its source from a git context pinned to
+          # GITHUB_SHA.  On the workflow_dispatch path GITHUB_SHA is the head of
+          # the dispatched branch rather than the release tag, so the image would
+          # carry newer code under the release version.  Publishing a version
+          # whose content does not match its tag is worse than not publishing it.
+          if [[ "${GITHUB_SHA}" != "${RELEASE_COMMIT}" ]]; then
+            echo "Skipping the container image: GITHUB_SHA ${GITHUB_SHA} is not the release commit ${RELEASE_COMMIT}"
+            echo "| Result | \`skipped\`, built commit does not match the release commit |" >> "${GITHUB_STEP_SUMMARY}"
+            echo "skip=true" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          tags="$(mise run container:tags)"
+          echo "Resolved image tags:"
+          echo "${tags}"
+          {
+            echo "skip=false"
+            echo "tags<<TAGS_EOF"
+            echo "${tags}"
+            echo "TAGS_EOF"
+          } >> "${GITHUB_OUTPUT}"
+
+      - name: Verify project version
+        if: ${{ steps.tags.outputs.skip != 'true' }}
+        env:
+          RELEASE_TAG: ${{ needs.version.outputs.tag }}
+        run: mise run release:version:check
+
+  container:
+    name: Publish Container Image
+    needs:
+      - version
+      - release
+      - container-tags
+    if: ${{ needs.version.outputs.should_release == 'true' && needs.container-tags.outputs.skip != 'true' }}
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    uses: docker/github-builder/.github/workflows/build.yml@cbc9d42f8c89a55623392aadd03600965b80e963 # v1.18.1
+    with:
+      output: image
+      push: true
+      context: .
+      file: Dockerfile
+      platforms: linux/amd64,linux/arm64
+      meta-images: ghcr.io/${{ github.repository_owner }}/tgbridge
+      meta-tags: ${{ needs.container-tags.outputs.tags }}
+      labels: |
+        org.opencontainers.image.source=https://github.com/${{ github.repository }}
+        org.opencontainers.image.title=TgBridge
+        org.opencontainers.image.description=Minimal personal bot mirroring forwarded Telegram files to Google Drive via rclone
+      cache: true
+      cache-scope: tgbridge
+    secrets:
+      registry-auths: |
+        - registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
   close-superseded-release-pr:
     name: Close Superseded Release PR
     needs:

@@ -36,7 +36,9 @@ jobs:
         uses: jdx/mise-action@8418fedb1110381a0d3ba51a7a415d7c1b884550 # v5.2.2
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
-          install_args: git-cliff
+          # git-cliff renders the changelog and the release notes; uv writes the
+          # version into pyproject.toml and uv.lock.
+          install_args: git-cliff uv
           add_shims_to_path: true
           cache_key: "mise-prepare-release-{{install_args_hash}}-{{file_hash}}"
 
@@ -93,13 +95,19 @@ jobs:
           RELEASE_TAG: ${{ steps.release.outputs.tag }}
         run: mise run release:changelog
 
+      - name: Sync project version
+        if: ${{ steps.release.outputs.should_prepare == 'true' }}
+        env:
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+        run: mise run release:version:sync
+
       - name: Push release branch
         id: branch
         if: ${{ steps.release.outputs.should_prepare == 'true' }}
         env:
           RELEASE_TAG: ${{ steps.release.outputs.tag }}
         run: |
-          release_files=("CHANGELOG.md")
+          release_files=("CHANGELOG.md" "pyproject.toml" "uv.lock")
           if [[ -z "$(git status --porcelain -- "${release_files[@]}")" ]]; then
             echo "Release files are already up to date"
             {

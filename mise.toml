@@ -140,13 +140,13 @@ description = "Build the container image locally"
 run = "docker build -t tgbridge:dev ."
 
 [tasks.'container:up']
-description = "Start the bot with docker compose"
+description = "Start the bot with docker compose, building from the local checkout"
 depends = ["container:build"]
-run = "docker compose up -d"
+run = "docker compose -f compose.yaml -f compose.dev.yaml up -d"
 
 [tasks.'container:down']
 description = "Stop the bot and drop its volume"
-run = "docker compose down -v"
+run = "docker compose -f compose.yaml -f compose.dev.yaml down -v"
 
 [tasks.'docs:install']
 description = "Install documentation site dependencies"
