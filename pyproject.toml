@@ -1,6 +1,6 @@
 [project]
 name = "tgbridge"
-version = "0.1.0"
+version = "0.1.1"
 description = "Minimal personal bot mirroring forwarded Telegram files to Google Drive via rclone"
 readme = "README.md"
 requires-python = ">=3.12"
