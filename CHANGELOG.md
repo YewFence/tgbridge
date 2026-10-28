@@ -1,3 +1,9 @@
+## What's Changed in 0.1.1
+* chore(mise-deps): update dependency typos to v1.51.1 by @renovate[bot] in [#2](https://github.com/YewFence/tgbridge/pull/2)
+* stop cancelled transfers and bound progress edits by @YewFence
+
+**Full Changelog**: https://github.com/YewFence/tgbridge/compare/v0.1.0...v0.1.1
+
 ## What's Changed in 0.1.0
 * ci(deps): update github actions to v5.2.3 by @renovate[bot] in [#1](https://github.com/YewFence/tgbridge/pull/1)
 * publish the image to GHCR on release by @YewFence
