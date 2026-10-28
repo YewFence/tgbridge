@@ -10,6 +10,7 @@ from typing import Any
 import pytest
 
 from tgbridge import limits, uploader
+from tgbridge.errors import TelegramTransferError
 from tgbridge.model import ProgressSnapshot, TaskState
 
 
@@ -143,7 +144,7 @@ class FakeSendClient:
             await progress(50, 100)
             await asyncio.sleep(0.01)
             await progress(100, 100)
-        return None
+        return object()
 
     def stop_transmission(self) -> None:
         self.stopped += 1
@@ -163,6 +164,17 @@ async def test_back_send_reports_speed(tmp_path: Path) -> None:
     ]
     assert reporter.snapshots[-1].speed > 0
     assert reporter.snapshots[-1].current == 100
+
+
+async def test_back_send_without_a_result_is_an_error(tmp_path: Path) -> None:
+    class EmptySendClient(FakeSendClient):
+        async def send_document(self, **kwargs: Any) -> None:
+            return None
+
+    with pytest.raises(TelegramTransferError):
+        await uploader.BackUploader(EmptySendClient()).send(
+            42, tmp_path / "a.bin", FakeReporter(), "a.bin"
+        )
 
 
 # --------------------------------------------------------------- rclone remote

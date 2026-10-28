@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import dataclasses
 import json
 import logging
@@ -17,7 +18,7 @@ from pyrogram import StopTransmission
 
 from tgbridge import limits, progress
 from tgbridge.downloader import SpeedMeter, with_flood_retry
-from tgbridge.errors import RcloneError, TaskCancelled
+from tgbridge.errors import RcloneError, TaskCancelled, TelegramTransferError
 from tgbridge.model import ProgressSnapshot, TaskState
 
 if TYPE_CHECKING:
@@ -49,6 +50,8 @@ class RcloneUploader:
         label: str,
         file_count: int = 1,
     ) -> None:
+        if reporter.cancelled:
+            raise TaskCancelled
         command = [
             self._binary,
             "move",
@@ -67,12 +70,16 @@ class RcloneUploader:
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.PIPE,
         )
-        reporter.add_cancel_hook(process.kill)
+
+        def stop_process() -> None:
+            with contextlib.suppress(ProcessLookupError):
+                process.kill()
 
         done = 0
         last_error: str | None = None
         assert process.stderr is not None
         try:
+            reporter.add_cancel_hook(stop_process)
             async for raw_line in process.stderr:
                 line = _ANSI.sub("", raw_line.decode(errors="replace")).strip()
                 if not line:
@@ -100,8 +107,11 @@ class RcloneUploader:
                     if message:
                         last_error = message
                 if reporter.cancelled:
-                    process.kill()
+                    stop_process()
                     break
+        except BaseException:
+            stop_process()
+            raise
         finally:
             await process.wait()
 
@@ -126,6 +136,8 @@ class BackUploader:
         index: int = 1,
         count: int = 1,
     ) -> None:
+        if reporter.cancelled:
+            raise TaskCancelled
         meter = SpeedMeter()
 
         async def on_progress(current: int, total: int) -> None:
@@ -145,7 +157,7 @@ class BackUploader:
             )
 
         try:
-            await with_flood_retry(
+            result = await with_flood_retry(
                 lambda: self._client.send_document(
                     chat_id=chat_id,
                     document=str(document),
@@ -154,6 +166,11 @@ class BackUploader:
             )
         except StopTransmission as error:
             raise TaskCancelled from error
+        if reporter.cancelled:
+            raise TaskCancelled
+        if result is None:
+            message = "Telegram upload returned no message"
+            raise TelegramTransferError(message)
 
 
 @dataclasses.dataclass(frozen=True)

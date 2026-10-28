@@ -704,7 +704,8 @@ class BotHandlers:
             return
         cancelled = self._manager.cancel(payload)
         await self._client.answer_callback_query(
-            callback_query_id=callback.id, text="已取消" if cancelled else "任务已结束"
+            callback_query_id=callback.id,
+            text="正在取消" if cancelled else "任务已结束",
         )
 
     # ---------------------------------------------------------------- helpers

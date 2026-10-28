@@ -9,7 +9,7 @@ import pytest
 from pyrogram import StopTransmission, errors, types
 
 from tgbridge import downloader
-from tgbridge.errors import TaskCancelled
+from tgbridge.errors import TaskCancelled, TelegramTransferError
 from tgbridge.model import ProgressSnapshot, TaskFile, TaskState
 
 
@@ -82,22 +82,29 @@ async def test_download_stops_when_cancelled(tmp_path: Path) -> None:
     client = FakeClient()
     reporter = FakeReporter(cancelled=True)
 
-    result = await downloader.Downloader(client).download(
-        make_file(), tmp_path / "a.bin", reporter
-    )
-
-    assert client.stopped >= 1
-    assert result == tmp_path / "a.bin"
-
-
-async def test_none_result_means_cancelled(tmp_path: Path) -> None:
-    class CancellingClient(FakeClient):
-        async def download_media(self, **kwargs: Any) -> str | None:
-            return None
-
     with pytest.raises(TaskCancelled):
-        await downloader.Downloader(CancellingClient()).download(
-            make_file(), tmp_path / "a.bin", FakeReporter()
+        await downloader.Downloader(client).download(
+            make_file(), tmp_path / "a.bin", reporter
+        )
+
+    assert reporter.snapshots == []
+    assert not (tmp_path / "a.bin").exists()
+
+
+@pytest.mark.parametrize("cancelled", [False, True])
+async def test_none_result_distinguishes_failure_from_cancellation(
+    tmp_path: Path, cancelled: bool
+) -> None:
+    reporter = FakeReporter()
+
+    class EmptyClient(FakeClient):
+        async def download_media(self, **kwargs: Any) -> None:
+            reporter._cancelled = cancelled
+
+    expected = TaskCancelled if cancelled else TelegramTransferError
+    with pytest.raises(expected):
+        await downloader.Downloader(EmptyClient()).download(
+            make_file(), tmp_path / "a.bin", reporter
         )
 
 

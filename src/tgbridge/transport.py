@@ -7,11 +7,8 @@ The task, download, upload, and handler layers depend on the narrow protocols in
 
 from __future__ import annotations
 
-import contextlib
 from collections.abc import Callable, Sequence
 from typing import TYPE_CHECKING
-
-from pyrogram import StopTransmission
 
 if TYPE_CHECKING:
     from pyrogram import Client, types
@@ -45,8 +42,7 @@ class TelegramTransport:
     def stop_transmission(self) -> None:
         """Abort the transfer in flight; only meaningful inside a progress callback."""
 
-        with contextlib.suppress(StopTransmission):
-            self._client.stop_transmission()
+        self._client.stop_transmission()
 
     # --------------------------------------------------------------- uploads
 

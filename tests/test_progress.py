@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 from pyrogram.types import InlineKeyboardMarkup
 
@@ -294,6 +296,33 @@ async def test_cancel_hook_added_after_cancel_runs_immediately() -> None:
     message.add_cancel_hook(lambda: hits.append("killed"))
 
     assert hits == ["killed"]
+
+
+@pytest.mark.parametrize("final", [False, True])
+async def test_stalled_edit_times_out_without_blocking_the_task(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, final: bool
+) -> None:
+    interrupted = asyncio.Event()
+
+    class StalledEditor:
+        async def edit_message_text(self, **kwargs: object) -> object:
+            try:
+                await asyncio.Event().wait()
+            finally:
+                interrupted.set()
+
+    monkeypatch.setattr(progress, "EDIT_TIMEOUT_SECONDS", 0.01, raising=False)
+    message = progress.ProgressMessage(StalledEditor(), 1, 2, "task")
+    operation = (
+        message.finalize(snapshot(state=TaskState.CANCELLED))
+        if final
+        else message.publish(snapshot())
+    )
+
+    await asyncio.wait_for(operation, timeout=0.5)
+
+    assert interrupted.is_set()
+    assert "timed out" in caplog.text
 
 
 async def test_progress_message_survives_edit_errors() -> None:

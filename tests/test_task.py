@@ -6,17 +6,19 @@ import asyncio
 import io
 import zipfile
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
-from pyrogram import types
+from pyrogram import Client, errors, types
 
-from tgbridge import limits
+from tgbridge import limits, progress
 from tgbridge.config import Config
+from tgbridge.downloader import Downloader
 from tgbridge.errors import RcloneError, TaskCancelled
 from tgbridge.model import ProgressSnapshot, TaskFile, TaskKind, TaskSpec, TaskState
 from tgbridge.progress import Reporter
 from tgbridge.task import TaskManager
+from tgbridge.transport import TelegramTransport
 
 
 def source(message_id: int = 1) -> types.Message:
@@ -54,6 +56,7 @@ class FakeDownloader:
         self.calls: list[tuple[TaskFile, Path]] = []
         self._fail = fail
         self.gate: asyncio.Event | None = None
+        self.started = asyncio.Event()
 
     async def download(
         self,
@@ -64,6 +67,7 @@ class FakeDownloader:
         count: int = 1,
     ) -> Path:
         self.calls.append((file, destination))
+        self.started.set()
         if self.gate is not None:
             await self.gate.wait()
         if reporter.cancelled:
@@ -166,8 +170,9 @@ def build(
     mirror: FakeMirror | None = None,
     back: FakeBack | None = None,
     max_concurrent: int = 2,
+    client: FakeClient | None = None,
 ) -> tuple[TaskManager, FakeClient, FakeDownloader, FakeMirror, FakeBack]:
-    client = FakeClient()
+    client = client or FakeClient()
     downloader = downloader or FakeDownloader()
     mirror = mirror or FakeMirror()
     back = back or FakeBack()
@@ -328,15 +333,219 @@ async def test_unexpected_failure_keeps_the_exception_summary(tmp_path: Path) ->
 
 
 async def test_cancellation_during_download(tmp_path: Path) -> None:
-    downloader = FakeDownloader(fail=TaskCancelled())
+    downloader = FakeDownloader()
+    downloader.gate = asyncio.Event()
     manager, client, _, mirror, _ = build(tmp_path, downloader=downloader)
 
     task_id = await manager.start(make_spec())
-    manager.cancel(task_id)
-    await manager.wait_idle()
+    await asyncio.wait_for(downloader.started.wait(), timeout=0.5)
+    assert manager.cancel(task_id)
+    await asyncio.wait_for(manager.wait_idle(), timeout=0.5)
 
     assert mirror.calls == []
     assert "已取消" in client.last_text()
+    assert client.edits[-1][3] is None
+    assert manager.counts == (0, 0)
+    assert list(tmp_path.iterdir()) == []
+
+
+async def test_cancel_before_the_task_starts_still_finalizes(tmp_path: Path) -> None:
+    manager, client, downloader, mirror, _ = build(tmp_path)
+
+    task_id = await manager.start(make_spec())
+    assert manager.cancel(task_id)
+    await asyncio.wait_for(manager.wait_idle(), timeout=0.5)
+
+    assert downloader.calls == []
+    assert mirror.calls == []
+    assert "已取消" in client.last_text()
+    assert manager.retry_spec(101) == make_spec()
+    assert manager.counts == (0, 0)
+
+
+async def test_cancel_queued_task_does_not_wait_for_a_slot(tmp_path: Path) -> None:
+    cancelled = asyncio.Event()
+
+    class CancellationClient(FakeClient):
+        async def edit_message_text(self, **kwargs: Any) -> object:
+            result = await super().edit_message_text(**kwargs)
+            if "已取消" in kwargs["text"]:
+                cancelled.set()
+            return result
+
+    downloader = FakeDownloader()
+    downloader.gate = asyncio.Event()
+    manager, _, _, _, _ = build(
+        tmp_path,
+        downloader=downloader,
+        max_concurrent=1,
+        client=CancellationClient(),
+    )
+    await manager.start(make_spec(name="running.bin"))
+    await asyncio.wait_for(downloader.started.wait(), timeout=0.5)
+    queued_id = await manager.start(make_spec(name="queued.bin"))
+    await asyncio.sleep(0)
+    assert manager.counts == (1, 1)
+
+    try:
+        assert manager.cancel(queued_id)
+        await asyncio.wait_for(cancelled.wait(), timeout=0.5)
+        assert manager.counts == (1, 0)
+        assert len(downloader.calls) == 1
+    finally:
+        downloader.gate.set()
+        await manager.wait_idle()
+
+
+@pytest.mark.parametrize(
+    "state", [TaskState.DONE, TaskState.ERROR, TaskState.CANCELLED]
+)
+async def test_terminal_edit_does_not_hold_resources_or_allow_retry(
+    tmp_path: Path, state: TaskState
+) -> None:
+    editing = asyncio.Event()
+    release = asyncio.Event()
+
+    class BlockingClient(FakeClient):
+        async def edit_message_text(self, **kwargs: Any) -> object:
+            if any(word in kwargs["text"] for word in ("完成", "❗", "已取消")):
+                editing.set()
+                await release.wait()
+            return await super().edit_message_text(**kwargs)
+
+    mirror = FakeMirror(
+        fail=RcloneError("failed") if state is TaskState.ERROR else None
+    )
+    manager, client, _, _, _ = build(tmp_path, mirror=mirror, client=BlockingClient())
+    task_id = await manager.start(make_spec())
+    if state is TaskState.CANCELLED:
+        assert manager.cancel(task_id)
+
+    try:
+        await asyncio.wait_for(editing.wait(), timeout=0.5)
+        assert manager.counts == (0, 0)
+        assert list(tmp_path.iterdir()) == []
+        assert manager.retry_spec(101) is None
+    finally:
+        release.set()
+        await manager.wait_idle()
+
+    assert manager.is_done(101) is (state is TaskState.DONE)
+    assert client.edits[-1][3] is None
+
+
+async def test_repeated_cancel_does_not_interrupt_transfer_cleanup(
+    tmp_path: Path,
+) -> None:
+    cleaning = asyncio.Event()
+    release = asyncio.Event()
+    cleaned = asyncio.Event()
+
+    class CleaningDownloader(FakeDownloader):
+        async def download(
+            self,
+            file: TaskFile,
+            destination: Path,
+            reporter: Reporter,
+            index: int = 1,
+            count: int = 1,
+        ) -> Path:
+            try:
+                return await super().download(file, destination, reporter, index, count)
+            finally:
+                cleaning.set()
+                await release.wait()
+                cleaned.set()
+
+    downloader = CleaningDownloader()
+    downloader.gate = asyncio.Event()
+    manager, client, _, _, _ = build(tmp_path, downloader=downloader)
+    task_id = await manager.start(make_spec())
+    await asyncio.wait_for(downloader.started.wait(), timeout=0.5)
+
+    try:
+        assert manager.cancel(task_id)
+        await asyncio.wait_for(cleaning.wait(), timeout=0.5)
+        assert manager.cancel(task_id)
+    finally:
+        release.set()
+        await asyncio.wait_for(manager.wait_idle(), timeout=0.5)
+
+    assert cleaned.is_set()
+    assert "已取消" in client.last_text()
+    assert manager.counts == (0, 0)
+
+
+@pytest.mark.parametrize("waiting_for", ["flood", "transfer_slot"])
+async def test_cancel_interrupts_telegram_waits(
+    tmp_path: Path, waiting_for: str
+) -> None:
+    waiting = asyncio.Event()
+    slot = asyncio.Semaphore(0)
+
+    class WaitingClient:
+        attempts = 0
+
+        async def download_media(self, *args: Any, **kwargs: Any) -> None:
+            self.attempts += 1
+            waiting.set()
+            if waiting_for == "flood":
+                raise errors.FloodWait(value=3600)
+            async with slot:
+                raise AssertionError("the cancelled transfer must not acquire a slot")
+
+        def stop_transmission(self) -> None:
+            raise AssertionError("there are no progress callbacks while waiting")
+
+    raw = WaitingClient()
+    transport = TelegramTransport(cast("Client", raw))
+    client = FakeClient()
+    mirror = FakeMirror()
+    manager = TaskManager(
+        client,
+        make_config(tmp_path),
+        Downloader(transport),
+        mirror,
+        FakeBack(),
+    )
+    task_id = await manager.start(make_spec())
+    await asyncio.wait_for(waiting.wait(), timeout=0.5)
+
+    assert manager.cancel(task_id)
+    await asyncio.wait_for(manager.wait_idle(), timeout=0.5)
+
+    assert raw.attempts == 1
+    assert mirror.calls == []
+    assert "已取消" in client.last_text()
+    assert manager.counts == (0, 0)
+    assert list(tmp_path.iterdir()) == []
+
+
+async def test_cancel_finishes_when_progress_and_final_edits_stall(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    editing = asyncio.Event()
+    terminal = asyncio.Event()
+
+    class StalledClient(FakeClient):
+        async def edit_message_text(self, **kwargs: Any) -> object:
+            if "已取消" in kwargs["text"]:
+                terminal.set()
+            editing.set()
+            await asyncio.Event().wait()
+
+    monkeypatch.setattr(progress, "EDIT_TIMEOUT_SECONDS", 0.01)
+    manager, _, downloader, _, _ = build(tmp_path, client=StalledClient())
+    task_id = await manager.start(make_spec())
+    await asyncio.wait_for(editing.wait(), timeout=0.5)
+
+    assert manager.cancel(task_id)
+    await asyncio.wait_for(manager.wait_idle(), timeout=0.5)
+
+    assert terminal.is_set()
+    assert downloader.calls == []
+    assert manager.counts == (0, 0)
+    assert manager.retry_spec(101) == make_spec()
     assert list(tmp_path.iterdir()) == []
 
 

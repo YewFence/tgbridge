@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from collections.abc import Callable, Mapping
@@ -19,6 +20,7 @@ AGGREGATING_TEXT = "⏳ 聚合中…"
 # Below 5s so that rclone's 5-second stats lines pass the throttle at any phase;
 # exactly 5.0 would drop every other line when both clocks align.
 EDIT_INTERVAL_SECONDS = 4.5
+EDIT_TIMEOUT_SECONDS = 5.0
 CANCEL_PREFIX = "cancel:"
 CANCEL_BUTTON_TEXT = "❌ 取消"
 
@@ -189,12 +191,20 @@ class ProgressMessage:
             return
         markup = cancel_keyboard(self.task_id) if keyboard else None
         try:
-            await self._editor.edit_message_text(
-                chat_id=self.chat_id,
-                message_id=self.message_id,
-                text=text,
-                reply_markup=markup,
+            async with asyncio.timeout(EDIT_TIMEOUT_SECONDS):
+                await self._editor.edit_message_text(
+                    chat_id=self.chat_id,
+                    message_id=self.message_id,
+                    text=text,
+                    reply_markup=markup,
+                )
+        except TimeoutError:
+            LOGGER.warning(
+                "progress edit timed out after %ss",
+                EDIT_TIMEOUT_SECONDS,
+                extra={"task_id": self.task_id},
             )
+            return
         except errors.MessageNotModified:
             pass
         except errors.FloodWait as error:

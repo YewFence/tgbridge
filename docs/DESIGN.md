@@ -107,11 +107,14 @@ error 状态文案附异常摘要（如 `rclone exit 3: directory not found`）�
 
 ### 取消
 
-- 进度消息携带 inline 键盘「❌ 取消」按钮（`callback_data` 携带 task_id），点击即取消该任务：置 cancelled 标志 → 下载进度回调中触发 `stop_transmission()`，或 kill rclone 子进程
-- 仅活跃状态（queued/downloading/uploading）保留按钮，终态（done/error/cancelled）编辑消息时移除键盘
+- 进度消息携带 inline 键盘「❌ 取消」按钮（`callback_data` 携带 task_id）。点击后设置取消标志并取消任务协程，可打断排队、传输槽位等待、FloodWait 睡眠和网络等待；rclone 同时通过取消钩子 kill 子进程，并等待子进程退出。任务尚未启动时由任务入口检查取消标志，确保清理与最终消息编辑仍会执行。
+- 下载与回发进度回调中触发的 `stop_transmission()` 必须让 `StopTransmission` 传播回 kurigram 的传输循环；不得在适配层吞掉。传输返回后也检查取消标志，避免误报完成。
+- 取消按钮回调回复「正在取消」，任务退出后的进度消息才显示「已取消」。重复请求不再次取消协程，避免打断传输资源清理。
+- 仅活跃状态（queued/downloading/uploading）保留按钮，终态（done/error/cancelled）编辑消息时移除键盘。临时文件在最终消息编辑前清理；每次进度编辑最多等待 5 秒，超时记录警告后继续退出。最终消息更新失败可能保留旧文本，但不阻塞任务回收。
+- `/status` 仅统计活跃状态；最终消息编辑期间不计入进行中任务。为避免旧任务的最终消息覆盖重试进度，同一消息在最终编辑结束前不可重试。
 - callback 同样过白名单检查（白名单内可取消任意任务，无属主校验）
 - 不做全局取消命令：个人并发上限本来就低，异常情况直接杀进程
-- SIGTERM（`docker stop` / `systemctl stop`）：复用取消链路取消全部活跃任务（停下载、杀 rclone、清暂存、消息标 cancelled），在宽限期内退出
+- SIGTERM（`docker stop` / `systemctl stop`）：复用取消链路取消全部活跃任务（停下载、杀 rclone、清暂存、消息标 cancelled），宽限期结束后中断尚未完成的最终消息编辑并退出。
 
 ### 自动镜像开关（/auto）
 

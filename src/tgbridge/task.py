@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import dataclasses
 import logging
 import uuid
@@ -44,6 +43,7 @@ class TaskRecord:
     reporter: progress.ProgressMessage
     state: TaskState = TaskState.QUEUED
     handle: asyncio.Task[None] | None = None
+    started: bool = False
 
 
 class TaskManager:
@@ -124,7 +124,7 @@ class TaskManager:
 
     def _is_busy(self, message_id: int) -> bool:
         return any(
-            record.reporter.message_id == message_id and record.state in ACTIVE_STATES
+            record.reporter.message_id == message_id
             for record in self._records.values()
         )
 
@@ -132,23 +132,20 @@ class TaskManager:
         record = self._records.get(task_id)
         if record is None or record.state not in ACTIVE_STATES:
             return False
-        LOGGER.info("cancelling task %s", task_id)
-        record.reporter.request_cancel()
+        if not record.reporter.cancelled:
+            LOGGER.info("cancelling task %s", task_id)
+            record.reporter.request_cancel()
+            # Cancelling before _run enters its try block would skip finalization.
+            if record.started and record.handle is not None:
+                record.handle.cancel()
         return True
 
     async def cancel_all(self, grace: float = 5.0) -> None:
-        """Cancel every active task, giving it ``grace`` seconds before force-stopping it.
+        """Cancel active tasks and wait up to ``grace`` seconds for finalization."""
 
-        Cancelling cooperatively lets an in-flight transfer stop at the next chunk;
-        a task blocked on something that never polls (a stalled socket, a paused
-        rclone) is cancelled outright so ``docker stop`` stays inside its grace period.
-        """
-
-        pending = [
-            record for record in self._records.values() if record.state in ACTIVE_STATES
-        ]
+        pending = list(self._records.values())
         for record in pending:
-            record.reporter.request_cancel()
+            self.cancel(record.task_id)
 
         handles = {record.handle for record in pending if record.handle is not None}
         if not handles:
@@ -174,7 +171,11 @@ class TaskManager:
     def counts(self) -> tuple[int, int]:
         """``(active, queued)`` task counts for ``/status``."""
 
-        states = [record.state for record in self._records.values()]
+        states = [
+            record.state
+            for record in self._records.values()
+            if record.state in ACTIVE_STATES
+        ]
         queued = states.count(TaskState.QUEUED)
         return len(states) - queued, queued
 
@@ -182,7 +183,11 @@ class TaskManager:
         spec = record.spec
         work_dir = self._config.tmp_dir / record.task_id
         reporter = record.reporter
+        detail: str | None = None
+        record.started = True
         try:
+            if reporter.cancelled:
+                raise TaskCancelled
             await reporter.publish(
                 ProgressSnapshot(state=TaskState.QUEUED, name=spec.label)
             )
@@ -191,6 +196,8 @@ class TaskManager:
                     raise TaskCancelled
                 self._record_state(record, TaskState.DOWNLOADING)
                 paths = await self._download_all(record, work_dir)
+                if reporter.cancelled:
+                    raise TaskCancelled
 
                 self._record_state(record, TaskState.UPLOADING)
                 await reporter.publish(
@@ -208,6 +215,8 @@ class TaskManager:
                 else:
                     await self._send_back(record, work_dir, paths)
                     detail = None
+                if reporter.cancelled:
+                    raise TaskCancelled
 
             self._record_state(record, TaskState.DONE)
             LOGGER.info(
@@ -223,23 +232,18 @@ class TaskManager:
                     "detail": detail,
                 },
             )
-            await reporter.finalize(
-                ProgressSnapshot(state=TaskState.DONE, name=spec.label, detail=detail)
-            )
         except TaskCancelled:
             self._record_state(record, TaskState.CANCELLED)
             LOGGER.info(
                 "task %s cancelled", record.task_id, extra={"task_id": record.task_id}
             )
-            await reporter.finalize(
-                ProgressSnapshot(state=TaskState.CANCELLED, name=spec.label)
-            )
+            detail = None
         except asyncio.CancelledError:
             self._record_state(record, TaskState.CANCELLED)
-            with contextlib.suppress(Exception):
-                await reporter.finalize(
-                    ProgressSnapshot(state=TaskState.CANCELLED, name=spec.label)
-                )
+            detail = None
+            LOGGER.info(
+                "task %s cancelled", record.task_id, extra={"task_id": record.task_id}
+            )
             raise
         except Exception as error:
             self._record_state(record, TaskState.ERROR)
@@ -248,20 +252,23 @@ class TaskManager:
                 record.task_id,
                 extra={"task_id": record.task_id, "kind": str(spec.kind)},
             )
-            await reporter.finalize(
-                ProgressSnapshot(
-                    state=TaskState.ERROR, name=spec.label, detail=_describe(error)
-                )
-            )
+            detail = _describe(error)
         finally:
-            self._records.pop(record.task_id, None)
             remove_tree(work_dir)
+            try:
+                await reporter.finalize(
+                    ProgressSnapshot(state=record.state, name=spec.label, detail=detail)
+                )
+            finally:
+                self._records.pop(record.task_id, None)
 
     async def _download_all(self, record: TaskRecord, work_dir: Path) -> list[Path]:
         spec = record.spec
         count = len(spec.files)
         paths: list[Path] = []
         for index, file in enumerate(spec.files, start=1):
+            if record.reporter.cancelled:
+                raise TaskCancelled
             destination = work_dir / file.name
             LOGGER.info(
                 "downloading %d/%d %s (%d bytes)",

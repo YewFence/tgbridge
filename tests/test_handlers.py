@@ -813,7 +813,7 @@ async def test_cancel_callback_routes_to_the_task() -> None:
     await handlers.on_callback(None, callback("cancel:abc123", message(1, text="📥")))  # type: ignore[arg-type]
 
     assert manager.cancelled == ["abc123"]
-    assert client.answered == [("cb", "已取消")]
+    assert client.answered == [("cb", "正在取消")]
 
 
 async def test_cancel_callback_from_an_outsider_is_refused() -> None:

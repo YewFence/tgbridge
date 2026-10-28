@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING
 
 from pyrogram import StopTransmission, errors
 
-from tgbridge.errors import TaskCancelled
+from tgbridge.errors import TaskCancelled, TelegramTransferError
 from tgbridge.model import ProgressSnapshot, TaskState
 
 if TYPE_CHECKING:
@@ -91,6 +91,8 @@ class Downloader:
         index: int = 1,
         count: int = 1,
     ) -> Path:
+        if reporter.cancelled:
+            raise TaskCancelled
         destination.parent.mkdir(parents=True, exist_ok=True)
         meter = SpeedMeter()
 
@@ -120,6 +122,9 @@ class Downloader:
             )
         except StopTransmission as error:
             raise TaskCancelled from error
-        if not isinstance(result, str):
+        if reporter.cancelled:
             raise TaskCancelled
+        if not isinstance(result, str):
+            message = "Telegram download returned no file"
+            raise TelegramTransferError(message)
         return Path(result)

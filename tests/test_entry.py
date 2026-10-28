@@ -2,14 +2,20 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any, cast
 
 import pytest
-from pyrogram import Client, types
+from pyrogram import Client, StopTransmission, types
 
 from tgbridge import entry
 from tgbridge.config import Config
+from tgbridge.downloader import Downloader
+from tgbridge.errors import TaskCancelled
+from tgbridge.model import TaskFile
+from tgbridge.progress import ProgressMessage
 from tgbridge.transport import TelegramTransport
+from tgbridge.uploader import BackUploader
 
 
 def make_config(tmp_path: Any) -> Config:
@@ -143,10 +149,55 @@ async def test_download_media_swallows_non_path_results() -> None:
     )
 
 
-def test_stop_transmission_is_safe_outside_a_callback() -> None:
+def test_stop_transmission_propagates_to_the_transfer_loop() -> None:
     transport, _ = make_transport()
 
-    transport.stop_transmission()  # StopTransmission must not escape
+    with pytest.raises(StopTransmission):
+        transport.stop_transmission()
+
+
+@pytest.mark.parametrize("direction", ["download", "upload"])
+async def test_cancel_stops_a_transfer_through_the_adapter(
+    tmp_path: Path, direction: str
+) -> None:
+    class TransferringClient(FakeRawClient):
+        completed = False
+        stopped = False
+
+        async def transfer(self, **kwargs: Any) -> Any:
+            await kwargs["progress"](50, 100)
+            reporter.request_cancel()
+            try:
+                await kwargs["progress"](75, 100)
+            except StopTransmission:
+                self.stopped = True
+                return None
+            self.completed = True
+            return kwargs.get("file_name", media())
+
+        async def download_media(self, *args: Any, **kwargs: Any) -> Any:
+            return await self.transfer(**kwargs)
+
+        async def send_document(self, *args: Any, **kwargs: Any) -> Any:
+            return await self.transfer(**kwargs)
+
+    raw = TransferringClient()
+    transport = TelegramTransport(cast("Client", raw))
+    reporter = ProgressMessage(transport, 42, 2, "task")
+    destination = tmp_path / "a.bin"
+
+    with pytest.raises(TaskCancelled):
+        if direction == "download":
+            await Downloader(transport).download(
+                TaskFile(name="a.bin", size=100, source=media()),
+                destination,
+                reporter,
+            )
+        else:
+            await BackUploader(transport).send(42, destination, reporter, "a.bin")
+
+    assert raw.stopped
+    assert not raw.completed
 
 
 async def test_message_calls_pass_through() -> None:

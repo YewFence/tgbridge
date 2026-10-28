@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import stat
 from pathlib import Path
 
@@ -9,6 +11,7 @@ import pytest
 
 from tgbridge.errors import RcloneError, TaskCancelled
 from tgbridge.model import ProgressSnapshot, TaskState
+from tgbridge.progress import ProgressMessage
 from tgbridge.uploader import RcloneUploader
 
 
@@ -127,6 +130,54 @@ async def test_cancelled_reporter_kills_the_process(tmp_path: Path) -> None:
 
     with pytest.raises(TaskCancelled):
         await RcloneUploader(binary).upload(tmp_path, "gdrive:media", reporter, "a.bin")
+
+
+async def test_cancelling_the_upload_coroutine_reaps_the_process(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    publishing = asyncio.Event()
+    processes: list[asyncio.subprocess.Process] = []
+    create_process = asyncio.create_subprocess_exec
+
+    async def track_process(
+        *args: str, stdout: int, stderr: int
+    ) -> asyncio.subprocess.Process:
+        process = await create_process(*args, stdout=stdout, stderr=stderr)
+        processes.append(process)
+        return process
+
+    class BlockingEditor:
+        async def edit_message_text(self, **kwargs: object) -> object:
+            publishing.set()
+            await asyncio.Event().wait()
+
+    binary = make_stub(
+        tmp_path,
+        'echo \'{"stats":{"bytes":1,"totalBytes":100}}\' >&2\nexec sleep 60\n',
+    )
+    reporter = ProgressMessage(BlockingEditor(), 42, 1, "task")
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", track_process)
+    handle = asyncio.create_task(
+        RcloneUploader(binary).upload(tmp_path, "gdrive:media", reporter, "a.bin")
+    )
+
+    try:
+        await asyncio.wait_for(publishing.wait(), timeout=0.5)
+        handle.cancel()
+        done, pending = await asyncio.wait({handle}, timeout=0.5)
+        assert not pending
+        assert handle in done
+        with pytest.raises(asyncio.CancelledError):
+            await handle
+        assert processes[0].returncode is not None
+    finally:
+        for process in processes:
+            with contextlib.suppress(ProcessLookupError):
+                process.kill()
+            await process.communicate()
+        if not handle.done():
+            handle.cancel()
+        await asyncio.gather(handle, return_exceptions=True)
 
 
 async def test_a_cancel_hook_is_registered(tmp_path: Path) -> None:
