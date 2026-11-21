@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
@@ -112,9 +113,9 @@ class FakeRawClient:
         self.calls.append(("get_messages", args, kwargs))
         return []
 
-    async def get_stickers(self, *args: Any, **kwargs: Any) -> Any:
-        self.calls.append(("get_stickers", args, kwargs))
-        return []
+    async def get_sticker_set(self, *args: Any, **kwargs: Any) -> Any:
+        self.calls.append(("get_sticker_set", args, kwargs))
+        return SimpleNamespace(stickers=[])
 
     def stop_transmission(self) -> None:
         if self.raise_on_stop:
@@ -218,7 +219,7 @@ async def test_message_calls_pass_through() -> None:
         "delete_messages",
         "answer_callback_query",
         "get_messages",
-        "get_stickers",
+        "get_sticker_set",
         "send_document",
     ]
 
