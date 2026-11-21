@@ -95,4 +95,5 @@ class TelegramTransport:
         return await self._client.get_messages(chat_id, message_ids=ids)
 
     async def get_stickers(self, *, short_name: str) -> list[types.Sticker]:
-        return await self._client.get_stickers(short_name)
+        sticker_set = await self._client.get_sticker_set(short_name)
+        return sticker_set.stickers or []
